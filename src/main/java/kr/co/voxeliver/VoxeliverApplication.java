@@ -1,13 +1,12 @@
 package kr.co.voxeliver;
 
 import kr.co.voxeliver.network.GameServer;
+import kr.co.voxeliver.server.ServerConfig;
 
 public class VoxeliverApplication {
 
     public static void main(String[] args) {
-        System.out.println("Hello World");
-
-        GameServer gameServer = new GameServer(25565);
+        GameServer gameServer = new GameServer(ServerConfig.builder().build());
         gameServer.start();
     }
 }

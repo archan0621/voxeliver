@@ -5,11 +5,18 @@ plugins {
 group = 'kr.co.archan.lab'
 version = '1.0-SNAPSHOT'
 
+java {
+    sourceCompatibility = JavaVersion.VERSION_17
+    targetCompatibility = JavaVersion.VERSION_17
+}
+
 repositories {
     mavenCentral()
 }
 
 dependencies {
+    implementation 'kr.co.archan:voxelite:1.0-SNAPSHOT'
+
     //netty
     implementation 'io.netty:netty-all:4.2.10.Final'
 
