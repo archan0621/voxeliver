@@ -37,7 +37,6 @@ public class ServerRuntime {
     private final ServerConfig config;
     private final Map<Integer, ServerPlayer> playersById = new ConcurrentHashMap<>();
     private final AtomicBoolean running = new AtomicBoolean(false);
-    private final float tickDelta;
 
     private volatile VoxeliteEngine engine;
     private volatile Vector3 spawnPosition = new Vector3();
@@ -45,7 +44,6 @@ public class ServerRuntime {
 
     public ServerRuntime(ServerConfig config) {
         this.config = config;
-        this.tickDelta = 1f / config.tickRate;
     }
 
     public synchronized void start() {
@@ -252,9 +250,8 @@ public class ServerRuntime {
         ensureRunning();
         updateWorldStreaming();
         pruneTimedOutPlayers();
-        for (ServerPlayer player : playersById.values()) {
-            player.tick(tickDelta);
-        }
+        // The current multiplayer protocol sends client-predicted absolute positions.
+        // Running independent server gravity here fights jump arcs and causes visible snapping.
         for (ServerPlayer player : playersById.values()) {
             syncChunksForPlayer(player);
         }

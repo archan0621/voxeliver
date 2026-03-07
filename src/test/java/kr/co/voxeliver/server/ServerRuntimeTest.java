@@ -135,6 +135,42 @@ class ServerRuntimeTest {
         }
     }
 
+    @Test
+    void keepsAcceptedJumpPositionsStableAcrossServerTicks() {
+        ServerConfig config = ServerConfig.builder()
+            .worldPath(tempDir.resolve("jump-world").toString())
+            .initialChunkRadius(1)
+            .chunkPreloadRadius(1)
+            .visibleChunkRadius(1)
+            .keepLoadedChunkRadius(2)
+            .maxLoadedChunks(32)
+            .build();
+
+        ServerRuntime runtime = new ServerRuntime(config);
+        EmbeddedChannel channel = new EmbeddedChannel();
+
+        runtime.start();
+        try {
+            PlayerSession session = new PlayerSession(channel);
+            ServerPlayer player = runtime.login(session, "alice");
+            runtime.initializePlayerSession(player);
+            drainOutbound(channel);
+
+            Vector3 requestedPosition = new Vector3(runtime.getSpawnPosition()).add(0f, 1f, 0f);
+            assertTrue(runtime.handleMove(session, new MovePacket(1, requestedPosition.x, requestedPosition.y, requestedPosition.z)));
+
+            runtime.tick();
+
+            assertEquals(requestedPosition, player.getPlayer().getPosition());
+
+            PlayerStatePacket statePacket = assertInstanceOf(PlayerStatePacket.class, channel.readOutbound());
+            assertEquals(requestedPosition, statePacket.getPosition());
+        } finally {
+            runtime.stop();
+            channel.finishAndReleaseAll();
+        }
+    }
+
     private void drainOutbound(EmbeddedChannel channel) {
         while (channel.readOutbound() != null) {
             // discard bootstrap packets
