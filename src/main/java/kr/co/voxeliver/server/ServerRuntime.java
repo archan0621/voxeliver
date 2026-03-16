@@ -1,45 +1,30 @@
 package kr.co.voxeliver.server;
 
-import com.badlogic.gdx.math.MathUtils;
 import com.badlogic.gdx.math.Vector3;
-import java.util.ArrayList;
 import java.util.Collection;
-import java.util.HashSet;
-import java.util.List;
-import java.util.Map;
-import java.util.Set;
-import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.ThreadFactory;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import kr.co.voxelite.engine.VoxeliteEngine;
-import kr.co.voxelite.physics.AABB;
-import kr.co.voxelite.world.Chunk;
-import kr.co.voxelite.world.ChunkCoord;
-import kr.co.voxelite.world.ChunkManager;
 import kr.co.voxeliver.network.session.PlayerSession;
 import kr.co.voxeliver.network.protocol.impl.BlockUpdatePacket;
 import kr.co.voxeliver.network.protocol.impl.BreakBlockRequestPacket;
-import kr.co.voxeliver.network.protocol.impl.ChunkDataPacket;
-import kr.co.voxeliver.network.protocol.impl.ChunkUnloadPacket;
 import kr.co.voxeliver.network.protocol.impl.MovePacket;
 import kr.co.voxeliver.network.protocol.impl.PlaceBlockRequestPacket;
-import kr.co.voxeliver.network.protocol.impl.PlayerJoinedPacket;
-import kr.co.voxeliver.network.protocol.impl.PlayerLeftPacket;
-import kr.co.voxeliver.network.protocol.impl.PlayerStatePacket;
 import kr.co.voxeliver.server.player.ServerPlayer;
 import kr.co.voxeliver.server.world.FlatWorldGenerator;
 import kr.co.voxeliver.server.world.RadiusChunkLoadPolicy;
 
 public class ServerRuntime {
     private final ServerConfig config;
-    private final Map<Integer, ServerPlayer> playersById = new ConcurrentHashMap<>();
+    private final ServerPlayerRegistry playerRegistry = new ServerPlayerRegistry();
     private final AtomicBoolean running = new AtomicBoolean(false);
 
     private volatile VoxeliteEngine engine;
     private volatile Vector3 spawnPosition = new Vector3();
+    private volatile ServerWorldCoordinator worldCoordinator;
     private ScheduledExecutorService tickExecutor;
 
     public ServerRuntime(ServerConfig config) {
@@ -66,6 +51,7 @@ public class ServerRuntime {
             .build();
         engine.initialize();
         spawnPosition = new Vector3(engine.getPlayer().getPosition());
+        worldCoordinator = new ServerWorldCoordinator(config, engine, playerRegistry);
 
         tickExecutor = Executors.newSingleThreadScheduledExecutor(new TickThreadFactory());
         running.set(true);
@@ -84,7 +70,8 @@ public class ServerRuntime {
             tickExecutor = null;
         }
 
-        playersById.clear();
+        playerRegistry.clear();
+        worldCoordinator = null;
 
         if (engine != null) {
             engine.dispose();
@@ -95,43 +82,26 @@ public class ServerRuntime {
     public ServerPlayer login(PlayerSession session, String username) {
         ensureRunning();
         String sanitizedUsername = sanitizeUsername(username);
-        ServerPlayer existing = playersById.get(session.getPlayerId());
-        if (existing != null) {
-            existing.touch();
-            return existing;
-        }
-
-        ServerPlayer created = new ServerPlayer(session, sanitizedUsername, spawnPosition, engine.getWorld());
-        playersById.put(created.getPlayerId(), created);
-        return created;
+        return playerRegistry.login(session, sanitizedUsername, spawnPosition, engine.getWorld());
     }
 
     public void disconnect(PlayerSession session) {
-        if (session == null) {
-            return;
-        }
-        ServerPlayer removed = playersById.remove(session.getPlayerId());
-        if (removed != null) {
-            broadcastPlayerLeft(removed);
+        ServerPlayer removed = playerRegistry.disconnect(session);
+        if (removed != null && worldCoordinator != null) {
+            worldCoordinator.broadcastPlayerLeft(removed);
         }
     }
 
     public void touch(PlayerSession session) {
-        ServerPlayer player = getPlayer(session);
-        if (player != null) {
-            player.touch();
-        }
+        playerRegistry.touch(session);
     }
 
     public ServerPlayer getPlayer(PlayerSession session) {
-        if (session == null) {
-            return null;
-        }
-        return playersById.get(session.getPlayerId());
+        return playerRegistry.get(session);
     }
 
     public Collection<ServerPlayer> getPlayers() {
-        return new ArrayList<>(playersById.values());
+        return playerRegistry.snapshot();
     }
 
     public Vector3 getSpawnPosition() {
@@ -147,23 +117,9 @@ public class ServerRuntime {
     }
 
     public void initializePlayerSession(ServerPlayer player) {
-        if (player == null) {
-            return;
+        if (worldCoordinator != null) {
+            worldCoordinator.initializePlayerSession(player);
         }
-
-        for (ServerPlayer other : playersById.values()) {
-            if (other.getPlayerId() == player.getPlayerId()) {
-                continue;
-            }
-            player.getSession().send(new PlayerJoinedPacket(
-                other.getPlayerId(),
-                other.getUsername(),
-                other.getPlayer().getPosition()
-            ));
-        }
-
-        broadcastPlayerJoined(player);
-        syncChunksForPlayer(player);
     }
 
     public boolean handleMove(PlayerSession session, MovePacket movePacket) {
@@ -180,14 +136,14 @@ public class ServerRuntime {
         Vector3 requestedPosition = new Vector3(movePacket.getX(), movePacket.getY(), movePacket.getZ());
         if (!isFinite(requestedPosition)) {
             player.setLastProcessedMoveSequence(movePacket.getSequence());
-            sendAuthoritativePlayerState(player);
+            worldCoordinator.sendAuthoritativePlayerState(player);
             return false;
         }
 
         float moveDistance = requestedPosition.dst(player.getPlayer().getPosition());
         if (moveDistance > config.maxMoveDistancePerRequest) {
             player.setLastProcessedMoveSequence(movePacket.getSequence());
-            sendAuthoritativePlayerState(player);
+            worldCoordinator.sendAuthoritativePlayerState(player);
             return false;
         }
 
@@ -205,21 +161,21 @@ public class ServerRuntime {
         player.touch();
         Vector3 blockPosition = packet.getPosition();
         if (!canInteractWithBlock(player, blockPosition)) {
-            sendAuthoritativeBlockState(player, blockPosition);
+            worldCoordinator.sendAuthoritativeBlockState(player, blockPosition);
             return false;
         }
         if (!engine.getWorld().hasBlock(blockPosition)) {
-            sendAuthoritativeBlockState(player, blockPosition);
+            worldCoordinator.sendAuthoritativeBlockState(player, blockPosition);
             return false;
         }
 
         if (!engine.removeBlock(blockPosition)) {
-            sendAuthoritativeBlockState(player, blockPosition);
+            worldCoordinator.sendAuthoritativeBlockState(player, blockPosition);
             return false;
         }
 
-        invalidateAllPhysicsCaches();
-        broadcastBlockUpdate(new BlockUpdatePacket(blockPosition, -1));
+        worldCoordinator.invalidateAllPhysicsCaches();
+        worldCoordinator.broadcastBlockUpdate(new BlockUpdatePacket(blockPosition, -1));
         return true;
     }
 
@@ -232,30 +188,28 @@ public class ServerRuntime {
         player.touch();
         Vector3 blockPosition = packet.getPosition();
         if (!canInteractWithBlock(player, blockPosition) || packet.getBlockType() < 0) {
-            sendAuthoritativeBlockState(player, blockPosition);
+            worldCoordinator.sendAuthoritativeBlockState(player, blockPosition);
             return false;
         }
         if (engine.getWorld().hasBlock(blockPosition) || wouldCollideWithPlayer(player, blockPosition)) {
-            sendAuthoritativeBlockState(player, blockPosition);
+            worldCoordinator.sendAuthoritativeBlockState(player, blockPosition);
             return false;
         }
 
         engine.addBlock(blockPosition, packet.getBlockType());
-        invalidateAllPhysicsCaches();
-        broadcastBlockUpdate(new BlockUpdatePacket(blockPosition, packet.getBlockType()));
+        worldCoordinator.invalidateAllPhysicsCaches();
+        worldCoordinator.broadcastBlockUpdate(new BlockUpdatePacket(blockPosition, packet.getBlockType()));
         return true;
     }
 
     void tick() {
         ensureRunning();
-        updateWorldStreaming();
+        worldCoordinator.updateWorldStreaming(spawnPosition);
         pruneTimedOutPlayers();
         // The current multiplayer protocol sends client-predicted absolute positions.
         // Running independent server gravity here fights jump arcs and causes visible snapping.
-        for (ServerPlayer player : playersById.values()) {
-            syncChunksForPlayer(player);
-        }
-        broadcastPlayerStates();
+        worldCoordinator.syncChunksForAllPlayers();
+        worldCoordinator.broadcastPlayerStates();
     }
 
     private void runTickSafely() {
@@ -271,119 +225,9 @@ public class ServerRuntime {
 
     private void pruneTimedOutPlayers() {
         long now = System.currentTimeMillis();
-        for (ServerPlayer player : playersById.values()) {
-            if (now - player.getLastHeartbeatAt() <= config.keepAliveTimeoutMillis) {
-                continue;
-            }
-
-            playersById.remove(player.getPlayerId());
+        for (ServerPlayer player : playerRegistry.removeTimedOut(now, config.keepAliveTimeoutMillis)) {
             player.getSession().getChannel().close();
         }
-    }
-
-    private void updateWorldStreaming() {
-        List<Vector3> playerPositions = new ArrayList<>();
-        for (ServerPlayer player : playersById.values()) {
-            playerPositions.add(new Vector3(player.getPlayer().getPosition()));
-        }
-
-        if (playerPositions.isEmpty()) {
-            playerPositions.add(new Vector3(spawnPosition));
-        }
-
-        engine.getWorld().updateChunks(playerPositions);
-        engine.getWorld().processPendingChunks();
-    }
-
-    private void syncChunksForPlayer(ServerPlayer player) {
-        ChunkManager chunkManager = engine.getWorld().getChunkManager();
-        if (chunkManager == null) {
-            return;
-        }
-
-        Set<ChunkCoord> visibleChunks = getVisibleChunkCoords(player.getPlayer().getPosition());
-
-        for (ChunkCoord coord : player.getLoadedChunksSnapshot()) {
-            if (visibleChunks.contains(coord)) {
-                continue;
-            }
-            player.forgetChunk(coord);
-            player.getSession().send(new ChunkUnloadPacket(coord));
-        }
-
-        for (ChunkCoord coord : visibleChunks) {
-            Chunk chunk = chunkManager.getChunk(coord);
-            if (chunk == null || !chunk.isGenerated()) {
-                continue;
-            }
-            if (player.rememberChunk(coord)) {
-                player.getSession().send(new ChunkDataPacket(chunk));
-            }
-        }
-    }
-
-    private Set<ChunkCoord> getVisibleChunkCoords(Vector3 position) {
-        Set<ChunkCoord> coords = new HashSet<>();
-        ChunkCoord center = ChunkCoord.fromWorldPos(position.x, position.z, Chunk.CHUNK_SIZE);
-        for (int dx = -config.visibleChunkRadius; dx <= config.visibleChunkRadius; dx++) {
-            for (int dz = -config.visibleChunkRadius; dz <= config.visibleChunkRadius; dz++) {
-                coords.add(new ChunkCoord(center.x + dx, center.z + dz));
-            }
-        }
-        return coords;
-    }
-
-    private void broadcastPlayerStates() {
-        List<ServerPlayer> snapshot = new ArrayList<>(playersById.values());
-        for (ServerPlayer recipient : snapshot) {
-            for (ServerPlayer player : snapshot) {
-                recipient.getSession().send(new PlayerStatePacket(
-                    player.getPlayerId(),
-                    player.getLastProcessedMoveSequence(),
-                    player.getPlayer().getPosition()
-                ));
-            }
-        }
-    }
-
-    private void broadcastPlayerJoined(ServerPlayer joinedPlayer) {
-        for (ServerPlayer recipient : playersById.values()) {
-            if (recipient.getPlayerId() == joinedPlayer.getPlayerId()) {
-                continue;
-            }
-
-            recipient.getSession().send(new PlayerJoinedPacket(
-                joinedPlayer.getPlayerId(),
-                joinedPlayer.getUsername(),
-                joinedPlayer.getPlayer().getPosition()
-            ));
-        }
-    }
-
-    private void broadcastPlayerLeft(ServerPlayer removedPlayer) {
-        PlayerLeftPacket packet = new PlayerLeftPacket(removedPlayer.getPlayerId());
-        for (ServerPlayer recipient : playersById.values()) {
-            recipient.getSession().send(packet);
-        }
-    }
-
-    private void broadcastBlockUpdate(BlockUpdatePacket packet) {
-        for (ServerPlayer recipient : playersById.values()) {
-            recipient.getSession().send(packet);
-        }
-    }
-
-    private void sendAuthoritativePlayerState(ServerPlayer player) {
-        player.getSession().send(new PlayerStatePacket(
-            player.getPlayerId(),
-            player.getLastProcessedMoveSequence(),
-            player.getPlayer().getPosition()
-        ));
-    }
-
-    private void sendAuthoritativeBlockState(ServerPlayer player, Vector3 blockPosition) {
-        int blockType = engine.getWorld().getBlockType(blockPosition);
-        player.getSession().send(new BlockUpdatePacket(blockPosition, blockType));
     }
 
     private boolean canInteractWithBlock(ServerPlayer player, Vector3 blockPosition) {
@@ -393,22 +237,7 @@ public class ServerRuntime {
     }
 
     private boolean wouldCollideWithPlayer(ServerPlayer player, Vector3 blockPosition) {
-        AABB blockAABB = new AABB(new Vector3(
-            MathUtils.floor(blockPosition.x),
-            MathUtils.floor(blockPosition.y),
-            MathUtils.floor(blockPosition.z)
-        ), 0.5f);
-        return player.getPlayer().getAABB().intersects(blockAABB);
-    }
-
-    private void invalidateAllPhysicsCaches() {
-        if (engine.getPhysics() != null) {
-            engine.getPhysics().invalidateCache();
-        }
-
-        for (ServerPlayer player : playersById.values()) {
-            player.getPhysics().invalidateCache();
-        }
+        return player.getPlayer().collidesWithBlock(blockPosition);
     }
 
     private boolean isFinite(Vector3 position) {
@@ -419,7 +248,7 @@ public class ServerRuntime {
     }
 
     private void ensureRunning() {
-        if (!running.get() || engine == null) {
+        if (!running.get() || engine == null || worldCoordinator == null) {
             throw new IllegalStateException("Server runtime is not running");
         }
     }
